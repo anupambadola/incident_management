@@ -1,13 +1,13 @@
 import sqlite3
-import random
 import openai
 import os
 import time
 import logging
-from typing import Optional
+import pandas as pd
+from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 
-# Load API key
+# ---- Setup ---- #
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 MODEL = "gpt-4o"
@@ -22,53 +22,43 @@ logging.basicConfig(
     filemode="a"
 )
 
-# ---- SQL Setup ---- #
 DB_FILE = "incidents.db"
 
+# ---- DB Setup ---- #
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS incidents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT,
-            description TEXT,
-            solution TEXT,
-            priority INTEGER
+            Incident_Number TEXT,
+            Customer_Name TEXT,
+            Organization TEXT,
+            Department TEXT,
+            Description TEXT,
+            Detailed_Description TEXT,
+            Reported_Date TEXT,
+            Solution TEXT,
+            Priority INTEGER
         )
     """)
     conn.commit()
     conn.close()
 
+# ---- Priority Calculation ---- #
+def calculate_priority(description: str, detailed_description: str) -> int:
+    desc = (description + " " + detailed_description).lower()
+    if any(word in desc for word in ["critical", "outage", "failure", "breach", "security"]):
+        return 5
+    elif any(word in desc for word in ["error", "crash", "slow", "timeout"]):
+        return 4
+    elif any(word in desc for word in ["bug", "issue", "problem"]):
+        return 3
+    elif any(word in desc for word in ["request", "access", "minor"]):
+        return 2
+    return 1
 
-# ---- Generate Mock Data (100 incidents) ---- #
-INCIDENT_TYPES = [
-    "Network Issue", "Application Crash", "Security Alert", "Hardware Failure",
-    "User Error", "Performance Degradation", "Software Bug", "Access Request",
-    "Service Outage", "Database Error", "Configuration Issue"
-]
-
-def populate_mock_data():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    sample_incidents = []
-    for i in range(1, 101):
-        inc_type = random.choice(INCIDENT_TYPES)
-        description = f"Sample incident {i}: {inc_type} occurred due to random event."
-        solution = f"Apply standard resolution procedure for {inc_type} (auto-generated)."
-        priority = random.randint(1, 5)  # 1=low, 5=high
-        sample_incidents.append((inc_type, description, solution, priority))
-
-    cursor.executemany(
-        "INSERT INTO incidents (type, description, solution, priority) VALUES (?, ?, ?, ?)",
-        sample_incidents
-    )
-    conn.commit()
-    conn.close()
-
-
-# ---- LLM Similarity Check ---- #
+# ---- Similarity Check ---- #
 SIMILARITY_PROMPT = """
 You are an assistant that checks whether two IT incidents describe the SAME issue.
 
@@ -84,9 +74,7 @@ Respond with ONLY one word:
 """
 
 def check_incident_similarity(incident_a: str, incident_b: str) -> bool:
-    """Uses LLM to check if two incidents are the same."""
     prompt = SIMILARITY_PROMPT.format(incident_a=incident_a, incident_b=incident_b)
-
     for attempt in range(MAX_RETRIES):
         try:
             response = openai.chat.completions.create(
@@ -102,48 +90,105 @@ def check_incident_similarity(incident_a: str, incident_b: str) -> bool:
         except Exception as e:
             logging.warning(f"Similarity check failed (attempt {attempt+1}): {e}")
             time.sleep(SLEEP_BETWEEN_RETRIES)
-
     logging.error("Failed to check similarity after retries.")
     return False
 
-
 # ---- Solution Retrieval ---- #
-def find_solution(new_incident: str) -> Optional[str]:
-    """
-    Given a new incident, check if a similar incident exists in DB.
-    Incidents are checked in order of priority (high first).
-    """
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT description, solution, priority FROM incidents ORDER BY priority DESC")
-    all_incidents = cursor.fetchall()
-    conn.close()
-
-    for desc, sol, priority in all_incidents:
-        if check_incident_similarity(new_incident, desc):
+def find_solution(new_description: str, new_detailed: str, existing_incidents: List[Tuple]) -> Optional[str]:
+    """Check for existing solutions in already loaded incidents (memory lookup)."""
+    new_text = f"{new_description} {new_detailed}"
+    for desc, det_desc, sol, priority in existing_incidents:
+        if check_incident_similarity(new_text, f"{desc} {det_desc}"):
             logging.info(f"Similar incident found with priority {priority}: {desc}")
             return sol
-
-    logging.info("No similar incident found in DB.")
     return None
 
+# ---- Get Solution from LLM ---- #
+def generate_solution(description: str, detailed: str) -> str:
+    prompt = f"""
+    Incident:
+    {description}\n{detailed}
 
-# ---- Demo Runner ---- #
-if __name__ == "__main__":
-    # Initialize DB and populate with mock data (run once)
-    init_db()
-    populate_mock_data()
+    Provide a concise IT support resolution (step-by-step if needed).
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = openai.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an IT support assistant that provides practical resolutions."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logging.warning(f"Solution generation failed (attempt {attempt+1}): {e}")
+            time.sleep(SLEEP_BETWEEN_RETRIES)
+    return "No solution could be generated."
 
-    test_incidents = [
-        "The database is throwing random connection errors.",
-        "Application crashes whenever the submit button is clicked.",
-        "Firewall detected an intrusion attempt from suspicious IP.",
-        "Server disk space almost full causing slowness."
-    ]
+# ---- Process Excel ---- #
+def process_excel(file_path: str):
+    df = pd.read_excel(file_path, sheet_name="Incident Details with REQ and R")
 
-    for inc in test_incidents:
-        solution = find_solution(inc)
-        if solution:
-            print(f"Incident: {inc}\n → Solution: {solution}\n")
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Load all existing incidents into memory once
+    cursor.execute("SELECT Description, Detailed_Description, Solution, Priority FROM incidents ORDER BY Priority DESC")
+    existing_incidents = cursor.fetchall()
+    db_empty = len(existing_incidents) == 0  # <-- check if DB is empty
+
+    new_records = []
+
+    df = df.sample(n=20, random_state=42) ## You can change/comment it according to your data
+    print(f"length is {len(df)}")
+
+    for idx, row in df.iterrows():
+        inc_no = row["Incident Number"]
+        cust = row["Customer Name"]
+        org = row["Organization"]
+        dept = row["Department"]
+        desc = str(row["Description"])
+        det_desc = str(row["Detailed Decription"])
+        rep_date = str(row["Reported Date"])
+
+        # Case 1: Empty DB → always generate from LLM
+        if db_empty:
+            solution = generate_solution(desc, det_desc)
+            logging.info(f"Generated new solution for Incident {inc_no} (DB empty)")
         else:
-            print(f"Incident: {inc}\n → No solution found in DB.\n")
+            # Case 2: Try to reuse, otherwise generate
+            existing_solution = find_solution(desc, det_desc, existing_incidents)
+            if existing_solution:
+                solution = existing_solution
+                logging.info(f"Reused solution for Incident {inc_no}")
+            else:
+                solution = generate_solution(desc, det_desc)
+                logging.info(f"Generated new solution for Incident {inc_no}")
+
+        priority = calculate_priority(desc, det_desc)
+
+        new_records.append((
+            inc_no, cust, org, dept, desc, det_desc, rep_date, solution, priority
+        ))
+
+        # Keep memory in sync (but only if DB wasn’t empty initially)
+        if not db_empty:
+            existing_incidents.append((desc, det_desc, solution, priority))
+
+    # Batch insert all at once
+    cursor.executemany("""
+        INSERT INTO incidents
+        (Incident_Number, Customer_Name, Organization, Department, Description, Detailed_Description, Reported_Date, Solution, Priority)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, new_records)
+
+    conn.commit()
+    conn.close()
+
+# ---- Runner ---- #
+if __name__ == "__main__":
+    init_db()
+    process_excel("Incident Details with REQ and Reason Oct23-Mar24-App-Only (1).xlsx")
+    print("Incidents processed and pushed into DB successfully.")
